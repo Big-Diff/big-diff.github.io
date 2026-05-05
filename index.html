@@ -51,117 +51,74 @@
   
 </head>
 <body>
-
-
  
 
-
-  <!-- <button class="scroll-to-top" onclick="scrollToTop()" title="Scroll to top" aria-label="Scroll to top">
-    <i class="fas fa-chevron-up"></i>
-  </button>
-
-  <div class="more-works-container">
-    <button class="more-works-btn" onclick="toggleMoreWorks()" title="View More Works from Our Lab">
-      <i class="fas fa-flask"></i>
-      More Works
-      <i class="fas fa-chevron-down dropdown-arrow"></i>
-    </button>
-    <div class="more-works-dropdown" id="moreWorksDropdown">
-      <div class="dropdown-header">
-        <h4>More Works from Our Lab</h4>
-        <button class="close-btn" onclick="toggleMoreWorks()">
-          <i class="fas fa-times"></i>
-        </button>
-      </div>
-      <div class="works-list">
-        <a href="https://dl.acm.org/doi/10.1145/3711896.3736935" class="work-item" target="_blank">
-          <div class="work-info">
-            <h5>Enhancing Generalization in Large-Scale HCVRP: A Rank-Augmented Neural Solver</h5>
-            <span class="work-venue">KDD 2025</span>
-          </div>
-          <i class="fas fa-external-link-alt"></i>
-        </a>
-        <a href="https://dl.acm.org/doi/10.5555/3635637.3662981" class="work-item" target="_blank">
-          <div class="work-info">
-            <h5>2D-Ptr: 2D Array Pointer Network for Solving the Heterogeneous Capacitated Vehicle Routing Problem</h5>
-            <span class="work-venue">AAMAS 2024</span>
-          </div>
-          <i class="fas fa-external-link-alt"></i>
-        </a>
-        
-      </div>
-    </div>
-  </div> -->
-
- 
-
-  <main id="main-content">
+ <main id="main-content">
   <section class="hero">
     <div class="hero-body">
       <div class="container is-max-desktop">
         <div class="columns is-centered">
           <div class="column has-text-centered">
-            <!-- TODO: Replace with your paper title -->
-            
-            <h1 class="title is-1 publication-title"  style="display: flex; align-items: center; justify-content: center;">
-              BigDiff: Bipartite Graph-Based Diffusion Solvers for  Vehicle Routing Problem
+
+            <!-- 论文标题 -->
+            <h1 class="title is-1 publication-title" style="display: flex; align-items: center; justify-content: center;">
+              BigDiff: Bipartite Graph-Based Diffusion Solvers for Vehicle Routing Problem
             </h1>
 
+            <!-- 匿名作者 -->
             <div class="is-size-5 publication-authors">
               <span class="author-block">Anonymous Author(s)</span>
             </div>
-            
+
+            <!-- 会议信息 -->
             <div class="is-size-5 publication-authors">
               <span class="author-block">
-                <!-- Affiliation<br>
-                Address<br>
-                email
-              </span> -->
-              <span class="author-block">
-                <span class="eql-cntrb"><small><br><sup>*</sup>Submitted to 40th Conference on Neural Information Processing Systems (NeurIPS 2026)</small></span>
+                <small><br>Submitted to 40th Conference on Neural Information Processing Systems (NeurIPS 2026)</small>
               </span>
             </div>
 
-                  <div class="column has-text-centered">
-                    <div class="publication-links">
-                      <!-- Parer Link. -->
-                      <span class="link-block">
-                        <a href="https://big-diff.github.io/" target="_blank"
-                        class="external-link button is-normal is-rounded is-dark">
-                        <span class="icon">
-                          <i class="fas fa-file-pdf"></i>
-                        </span>
-                        <span>Paper</span>
-                    
-                    </a>
-                    </span>
-                    <!-- Code Link. -->
-                    <span class="link-block">
-                      <a href="https://github.com/google/nerfies"
-                         class="external-link button is-normal is-rounded is-dark">
-                        <span class="icon">
-                            <i class="fab fa-github"></i>
-                        </span>
-                        <span>Code</span>
-                    
-                    </a>
-                    </span>
-                    <!-- Dataset Link. -->
-                    <span class="link-block">
-                      <a href="https://github.com/google/nerfies/releases/tag/0.1"
-                         class="external-link button is-normal is-rounded is-dark">
-                        <span class="icon">
-                            <i class="far fa-images"></i>
-                        </span>
-                        <span>Data</span>                    
-                      
+            <!-- 按钮区域 -->
+            <div class="publication-links">
+              <!-- Paper 按钮 -->
+              <span class="link-block">
+                <a href="https://big-diff.github.io/" target="_blank"
+                  class="external-link button is-normal is-rounded is-dark">
+                  <span class="icon">
+                    <i class="fas fa-file-pdf"></i>
+                  </span>
+                  <span>Paper</span>
+                </a>
+              </span>
+
+              <!-- Code 按钮 -->
+              <span class="link-block">
+                <a href="https://github.com/BigDiff"
+                  class="external-link button is-normal is-rounded is-dark">
+                  <span class="icon">
+                    <i class="fab fa-github"></i>
+                  </span>
+                  <span>Code</span>
+                </a>
+              </span>
+
+              <!-- Data 按钮 -->
+              <span class="link-block">
+                <a href="#"
+                  class="external-link button is-normal is-rounded is-dark">
+                  <span class="icon">
+                    <i class="far fa-images"></i>
+                  </span>
+                  <span>Data</span>
+                </a>
+              </span>
             </div>
+
           </div>
         </div>
       </div>
     </div>
-  </div>
-</section>
+  </section>
+</main>
 
 
 
@@ -230,10 +187,10 @@
           <span class="copy-text">Copy</span>
         </button>
       </div>
-      <pre id="bibtex-code"><code>@article{Qimen2026,
+      <pre id="bibtex-code"><code>@article{BigDiff,
   title={BigDiff: Bipartite Graph-Based Diffusion Solvers for  Vehicle Routing Problem},
   author={Anonymous Author(s)},
-  journal={40th Conference on Neural Information Processing Systems (NeurIPS 2026},
+  journal={40th Conference on Neural Information Processing Systems (NeurIPS 2026)},
   year={2026},
   url={https://big-diff.github.io}
 }</code></pre>
