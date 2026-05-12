@@ -19,11 +19,11 @@ This design allows the diffusion model to explicitly use both customer-side info
 BigDiff represents each VRP instance as a **slot-customer bipartite graph**.  
 A slot corresponds to a candidate route that starts and ends at the depot, while each customer is assigned to one slot. The diffusion model predicts the posterior assignment heatmap:
 
-\[
+$$
 P_\theta(y_0 \mid x_T)
-\]
+$$
 
-where \(x_T\) is an initial sampled noisy assignment state and \(y_0\) is the clean customer-to-slot assignment.
+where $x_T$ is an initial sampled noisy assignment state and $y_0$ is the clean customer-to-slot assignment.
 
 The predicted heatmap is then decoded into feasible routes through capacity-aware projection and route-level refinement.
 
@@ -40,8 +40,8 @@ The predicted heatmap is then decoded into feasible routes through capacity-awar
 The case visualization shows the full inference pipeline:
 
 1. Input VRP / HFVRP instance.
-2. Initial sampled noisy assignment state \(x_T\).
-3. Predicted posterior heatmap \(P_\theta(y_0 \mid x_T)\).
+2. Initial sampled noisy assignment state $x_T$.
+3. Predicted posterior heatmap $P_\theta(y_0 \mid x_T)$.
 4. Final decoded and refined routing solution.
 
 Since BigDiff uses a consistency-style diffusion model, inference can be performed in a single denoising step.
