@@ -17,36 +17,29 @@ python train.py \
   --hidden_dim 192 \
   --gnn_layers 4 \
   --biattn_heads 4 \
+  --dropout 0.05 \
   --use_v2v \
   --v2v_every 2 \
   --v2v_heads 4 \
   --v2v_dropout 0.05 \
   --v2v_ffn_mult 2 \
   --n2n_mode attn \
+  --n2n_knn_k 16 \
   --n2n_attn_heads 4 \
   --n2n_attn_dropout 0.05 \
   --n2n_attn_ffn_mult 2 \
-  --dropout 0.05 \
   --inference_schedule cosine \
   --inference_diffusion_steps 1 \
   --parallel_sampling 1 \
-  --alpha 0.5 \
   --consistency \
-  --lam_pair 1.0 \
-  --lam_row 0.1 \
-  --lam_cons 0.01 \
-  --pair_pos_samples 256 \
-  --pair_neg_samples 256 \
+  --alpha 0.5 \
   --refine_threads 8 \
   --eval_deterministic \
   --eval_seed 12345 \
-  --ckpt_monitor val/cost_refined \
   --num_workers 8 \
-  --check_val_every_n_epoch 1 \
   --read_pyvrp_budget_ms 500 \
-  --n2n_knn_k 16 \
   --test_examples 128 \
-  --ckpt_path /home/aiworker/code/Fast-T2T-main/data/cvrp/models/cvrp50_newgnn_full_pilot/checkpoints/epoch=89-step=52650.ckpt \
+  --ckpt_path /home/aiworker/code/Fast-T2T-main/data/cvrp/models/cvrp_o3.12_v4_train/checkpoints/epoch=31-step=74976.ckpt \
   --do_test \
   --report_time \
   --report_time_split test \

@@ -46,8 +46,8 @@ torchrun --standalone --nproc_per_node=2 train.py \
   --inference_schedule cosine \
   --inference_diffusion_steps 1 \
   --parallel_sampling 1 \
-  --alpha 0.5 \
   --consistency \
+  --alpha 0.5 \
   --lam_pair 1.0 \
   --lam_row 0.1 \
   --lam_cons 0.01 \
@@ -58,14 +58,4 @@ torchrun --standalone --nproc_per_node=2 train.py \
   --eval_seed 12345 \
   --ckpt_monitor val/cost_refined \
   --num_workers 8 \
-  --check_val_every_n_epoch 1 \
-  --two_opt_iter 256 \
-  --read_pyvrp_budget_ms 20 \
-  --read_pyvrp_space_shortlist 64 \
-  --read_pyvrp_min_k 10 \
-  --read_pyvrp_max_k 48 \
-  --read_projector_topk 8 \
-  --read_projector_cum_prob 0.90 \
-  --read_projector_lam_balance 0.10 \
-  --read_projector_lam_compact 0.15 \
-  --n2n_knn_k 24
+  --read_pyvrp_budget_ms 20

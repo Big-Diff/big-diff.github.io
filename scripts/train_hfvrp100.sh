@@ -47,10 +47,10 @@ torchrun --standalone --nproc_per_node=2 train.py \
   --consistency \
   --alpha 0.5 \
   --xt_jitter 0.0 \
-  --hf_lam_type 0.0 \
+  --hf_lam_type 1.0 \
   --hf_lam_pair 1.0 \
-  --hf_lam_row 0.1 \
-  --hf_lam_cons 0.0 \
+  --hf_lam_row 0.10 \
+  --hf_lam_cons 0.01 \
   --hf_pair_pos_samples 256 \
   --hf_pair_neg_samples 256 \
   --refine_threads 8 \
@@ -73,11 +73,5 @@ torchrun --standalone --nproc_per_node=2 train.py \
   --n2n_attn_heads 4 \
   --n2n_attn_dropout 0.05 \
   --n2n_attn_ffn_mult 2 \
-  --read_use_pyvrp \
-  --read_pyvrp_budget_ms 20 \
-  --read_pyvrp_space_shortlist 64 \
-  --read_pyvrp_min_k 10 \
-  --read_pyvrp_max_k 48 \
-  --read_projector_topk 6 \
-  --read_projector_cum_prob 0.95 \
+  --read_pyvrp_budget_ms 10 \
   --hf_log_cost_gap

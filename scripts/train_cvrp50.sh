@@ -18,26 +18,22 @@ torchrun --standalone --nproc_per_node=2 train.py \
   --task cvrp \
   --fp16 \
   --project_name cvrp50_full_pilot \
-  --wandb_logger_name cvrp50_newgnn_full_pilot \
+  --wandb_logger_name cvrp50_release \
   --do_train \
   --learning_rate 0.0002 \
   --weight_decay 0.0001 \
   --lr_scheduler cosine-decay \
   --storage_path /home/aiworker/code/Fast-T2T-main/data/cvrp \
-  --train_split train/50_with_solution.npz\
+  --train_split train/50_with_solution.npz \
   --validation_split val/50_with_solution.npz \
   --test_split val/50_with_solution.npz \
   --num_vehicles 9 \
   --batch_size 128 \
-  --num_epochs 100 \
+  --num_epochs 5 \
   --hidden_dim 192 \
   --gnn_layers 4 \
   --biattn_heads 4 \
-  --use_v2v \
-  --v2v_every 2 \
-  --v2v_heads 4 \
-  --v2v_dropout 0.05 \
-  --v2v_ffn_mult 2 \
+  --dropout 0.05 \
   --use_v2v \
   --v2v_every 2 \
   --v2v_heads 4 \
@@ -47,18 +43,16 @@ torchrun --standalone --nproc_per_node=2 train.py \
   --n2n_attn_heads 4 \
   --n2n_attn_dropout 0.05 \
   --n2n_attn_ffn_mult 2 \
-  --dropout 0.05 \
+  --n2n_knn_k 16 \
   --validation_examples 128 \
   --inference_schedule cosine \
   --inference_diffusion_steps 1 \
   --parallel_sampling 1 \
-  --alpha 0.5 \
   --consistency \
-  --xt_jitter 0.0 \
-  --hf_lam_type 0.0 \
-  --hf_lam_pair 1.0 \
-  --hf_lam_row 0.1 \
-  --hf_lam_cons 0.0 \
+  --alpha 0.5 \
+  --lam_pair 1.0 \
+  --lam_row 0.1 \
+  --lam_cons 0.01 \
   --pair_pos_samples 256 \
   --pair_neg_samples 256 \
   --refine_threads 2 \
@@ -66,16 +60,5 @@ torchrun --standalone --nproc_per_node=2 train.py \
   --eval_seed 12345 \
   --ckpt_monitor val/cost_refined \
   --num_workers 8 \
-  --check_val_every_n_epoch 1 \
-  --two_opt_iter 256 \
-  --read_pyvrp_budget_ms 20 \
-  --read_pyvrp_space_shortlist 64 \
-  --read_pyvrp_min_k 10 \
-  --read_pyvrp_max_k 24 \
-  --read_projector_topk 8 \
-  --read_projector_cum_prob 0.90 \
-  --read_projector_lam_balance 0.10 \
-  --read_projector_lam_compact 0.15 \
-  --n2n_knn_k 16
-
+  --read_pyvrp_budget_ms 20
 

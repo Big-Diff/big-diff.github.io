@@ -3,7 +3,7 @@ import pytorch_lightning as pl
 import torch
 import torch.nn.functional as F
 import torch.utils.data
-from torch_geometric.data import DataLoader as GraphDataLoader
+from torch_geometric.loader import DataLoader as GraphDataLoader
 from pytorch_lightning.utilities import rank_zero_info
 
 # from diffusion.models.gnn_encoder import GNNEncoder
@@ -21,20 +21,6 @@ class COMetaModel(pl.LightningModule):
         self.diffusion_schedule = self.args.diffusion_schedule
         self.diffusion_steps = self.args.diffusion_steps
         self.sparse = self.args.sparse_factor > 0 or node_feature_only
-
-        # out_channels = 2
-        # self.diffusion = CategoricalDiffusion(
-        #     T=self.diffusion_steps, schedule=self.diffusion_schedule)
-        #
-        # self.model = GNNEncoder(
-        #     n_layers=self.args.n_layers,
-        #     hidden_dim=self.args.hidden_dim,
-        #     out_channels=out_channels,
-        #     aggregation=self.args.aggregation,
-        #     sparse=self.sparse,
-        #     use_activation_checkpoint=self.args.use_activation_checkpoint,
-        #     node_feature_only=node_feature_only,
-        # )
         self.diffusion = CategoricalDiffusion(
             T=self.diffusion_steps, schedule=self.diffusion_schedule
         )
@@ -42,21 +28,7 @@ class COMetaModel(pl.LightningModule):
         # CVRP/HFVRP Stage-A 子类会在各自 __init__ 中覆盖 self.model
         self.model = None
         self.num_training_steps_cached = None
-        # self.output_dir = os.path.join('output', time.strftime('%Y-%m-%d-%H-%M-%S',time.localtime(time.time())))
-        # os.makedirs(self.output_dir)
 
-    # def test_epoch_end(self, outputs):
-    #     unmerged_metrics = {}
-    #     for metrics in outputs:
-    #         for k, v in metrics.items():
-    #             if k not in unmerged_metrics:
-    #                 unmerged_metrics[k] = []
-    #             unmerged_metrics[k].append(v)
-    #
-    #     merged_metrics = {}
-    #     for k, v in unmerged_metrics.items():
-    #         merged_metrics[k] = float(np.mean(v))
-    #     self.logger.log_metrics(merged_metrics, step=self.global_step)
 
     def get_total_num_training_steps(self) -> int:
         """Total training steps inferred from datamodule and devices."""
@@ -78,50 +50,27 @@ class COMetaModel(pl.LightningModule):
         return self.num_training_steps_cached
 
     def configure_optimizers(self):
-        main_params = []
-        k_params = []
+        params = [p for p in self.parameters() if p.requires_grad]
 
-        for name, p in self.named_parameters():
-            if not p.requires_grad:
-                continue
+        rank_zero_info(
+            "Trainable parameters: %d" % sum(p.numel() for p in params)
+        )
+        rank_zero_info(
+            "Training steps: %d" % self.get_total_num_training_steps()
+        )
 
-            if name.startswith("k_predictor."):
-                k_params.append(p)
-            else:
-                main_params.append(p)
-
-        rank_zero_info('Main parameters: %d' % sum(p.numel() for p in main_params))
-        rank_zero_info('K predictor parameters: %d' % sum(p.numel() for p in k_params))
-        rank_zero_info('Training steps: %d' % self.get_total_num_training_steps())
-
-        lr = float(self.args.learning_rate)
-        wd = float(self.args.weight_decay)
-        k_lr = float(getattr(self.args, "k_pred_lr", lr))
-
-        param_groups = [
-            {
-                "params": main_params,
-                "lr": lr,
-                "weight_decay": wd,
-            }
-        ]
-
-        if len(k_params) > 0:
-            param_groups.append(
-                {
-                    "params": k_params,
-                    "lr": k_lr,
-                    "weight_decay": wd,
-                }
-            )
+        optimizer = torch.optim.AdamW(
+            params,
+            lr=float(self.args.learning_rate),
+            weight_decay=float(self.args.weight_decay),
+        )
 
         if self.args.lr_scheduler == "constant":
-            return torch.optim.AdamW(param_groups)
+            return optimizer
 
-        optimizer = torch.optim.AdamW(param_groups)
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
-            T_max=self.args.num_epochs,
+            T_max=int(self.args.num_epochs),
             eta_min=0.0,
         )
 
@@ -132,170 +81,8 @@ class COMetaModel(pl.LightningModule):
                 "interval": "epoch",
             },
         }
-    def categorical_posterior(self, target_t, t, x0_pred_prob, xt):
-        """
-        Args:
-            target_t: int / tensor-like
-            t:        int / tensor-like
-            x0_pred_prob: (..., 2)  (dense: B,N,N,2 ; sparse: 1,BN,K,2 等)
-            xt:           (...)     (dense: B,N,N ; sparse: E)
 
-        Returns:
-            xt_next (same shape as xt, float/binary)
-            prob    (same shape as xt, float in [0,1])
-        """
-        diffusion = self.diffusion
-        device = x0_pred_prob.device
-        if xt.device != device:
-            xt = xt.to(device)
 
-        def _to_int_scalar(v, name: str):
-            if v is None:
-                return None
-            if isinstance(v, (int, np.integer)):
-                return int(v)
-            if torch.is_tensor(v):
-                vv = v.reshape(-1)
-                if vv.numel() == 0:
-                    raise ValueError(f"{name} is empty tensor")
-                if vv.numel() > 1:
-                    # 推理阶段一般应该都是同一个 timestep
-                    if not torch.all(vv == vv[0]).item():
-                        raise ValueError(
-                            f"{name} has multiple different values: "
-                            f"{vv[:8].detach().cpu().tolist()} ... (need scalar timestep)"
-                        )
-                return int(vv[0].item())
-            try:
-                return int(v)
-            except Exception as e:
-                raise TypeError(f"Cannot convert {name}={type(v)} to int: {e}")
-
-        t_int = _to_int_scalar(t, "t")
-        target_t_int = _to_int_scalar(target_t, "target_t")
-        if target_t_int is None:
-            target_t_int = t_int - 1
-
-        # Q_t
-        if target_t_int > 0:
-            Q_t = np.linalg.inv(diffusion.Q_bar[target_t_int]) @ diffusion.Q_bar[t_int]
-            Q_t = torch.from_numpy(Q_t).float().to(device)
-        else:
-            Q_t = torch.eye(2, device=device, dtype=torch.float32)
-
-        Q_bar_t_source = torch.from_numpy(diffusion.Q_bar[t_int]).float().to(device)
-        Q_bar_t_target = torch.from_numpy(diffusion.Q_bar[target_t_int]).float().to(device)
-
-        # xt -> onehot -> reshape到x0_pred_prob形状
-        xt_oh = F.one_hot(xt.long(), num_classes=2).float()
-        xt_oh = xt_oh.reshape(x0_pred_prob.shape)
-
-        # posterior math
-        x_t_target_prob_part_1 = torch.matmul(xt_oh, Q_t.t().contiguous())  # (...,2)
-
-        x_t_target_prob_part_2 = Q_bar_t_target[0]  # (2,)
-        x_t_target_prob_part_3 = (Q_bar_t_source[0] * xt_oh).sum(dim=-1, keepdim=True)  # (...,1)
-        x_t_target_prob = (x_t_target_prob_part_1 * x_t_target_prob_part_2) / (x_t_target_prob_part_3 + 1e-12)
-
-        sum_x_t_target_prob = x_t_target_prob[..., 1] * x0_pred_prob[..., 0]
-
-        x_t_target_prob_part_2_new = Q_bar_t_target[1]
-        x_t_target_prob_part_3_new = (Q_bar_t_source[1] * xt_oh).sum(dim=-1, keepdim=True)
-        x_t_source_prob_new = (x_t_target_prob_part_1 * x_t_target_prob_part_2_new) / (
-                    x_t_target_prob_part_3_new + 1e-12)
-
-        sum_x_t_target_prob = sum_x_t_target_prob + x_t_source_prob_new[..., 1] * x0_pred_prob[..., 1]
-        prob = torch.nan_to_num(sum_x_t_target_prob, nan=0.5, posinf=1.0, neginf=0.0)
-        prob = prob.clamp(0.0, 1.0)
-
-        # sample
-        if target_t_int > 0:
-            xt_next = torch.bernoulli(prob)
-        else:
-            xt_next = prob
-
-        return xt_next, prob
-
-    def guided_categorical_posterior(self, target_t, t, x0_pred_prob, xt, grad=None):
-        # xt: b, n, n
-        if grad is None:
-            grad = xt.grad
-        with torch.no_grad():
-            diffusion = self.diffusion
-            if target_t is None:
-                target_t = t - 1
-            else:
-                target_t = target_t.view(1)
-
-            if target_t > 0:
-                Q_t = np.linalg.inv(diffusion.Q_bar[target_t]) @ diffusion.Q_bar[t]
-                Q_t = torch.from_numpy(Q_t).float().to(x0_pred_prob.device)  # [2, 2], transition matrix
-            else:
-                Q_t = torch.eye(2).float().to(x0_pred_prob.device)
-            Q_bar_t_source = torch.from_numpy(diffusion.Q_bar[t]).float().to(x0_pred_prob.device)
-            Q_bar_t_target = torch.from_numpy(diffusion.Q_bar[target_t]).float().to(x0_pred_prob.device)
-
-            xt_grad_zero, xt_grad_one = torch.zeros(xt.shape, device=xt.device).unsqueeze(-1).repeat(1, 1, 1, 2), \
-                torch.zeros(xt.shape, device=xt.device).unsqueeze(-1).repeat(1, 1, 1, 2)
-            xt_grad_zero[..., 0] = (1 - xt) * grad
-            xt_grad_zero[..., 1] = -xt_grad_zero[..., 0]
-            xt_grad_one[..., 1] = xt * grad
-            xt_grad_one[..., 0] = -xt_grad_one[..., 1]
-            xt_grad = xt_grad_zero + xt_grad_one
-
-            # xt_grad = (
-            #     torch.zeros(xt.shape, device=xt.device).unsqueeze(-1).repeat(1, 1, 1, 2)
-            # )
-            # xt_grad[..., 1] = grad
-            # xt_grad[..., 0] = -grad
-            #
-            # torch.set_printoptions(threshold=np.inf)
-            # print(xt_grad_fake - xt_grad)
-            # input()
-
-            xt = F.one_hot(xt.long(), num_classes=2).float()
-            xt = xt.reshape(x0_pred_prob.shape)  # [b, n, n, 2]
-
-            # q(xt−1|xt,x0=0)pθ(x0=0|xt)
-            x_t_target_prob_part_1 = torch.matmul(xt, Q_t.permute((1, 0)).contiguous())
-            x_t_target_prob_part_2 = Q_bar_t_target[0]
-            x_t_target_prob_part_3 = (Q_bar_t_source[0] * xt).sum(dim=-1, keepdim=True)
-
-            x_t_target_prob = (x_t_target_prob_part_1 * x_t_target_prob_part_2) / x_t_target_prob_part_3  # [b, n, n, 2]
-
-            sum_x_t_target_prob = x_t_target_prob[..., 1] * x0_pred_prob[..., 0]
-
-            # q(xt−1|xt,x0=1)pθ(x0=1|xt)
-            x_t_target_prob_part_2_new = Q_bar_t_target[1]
-            x_t_target_prob_part_3_new = (Q_bar_t_source[1] * xt).sum(dim=-1, keepdim=True)
-
-            x_t_source_prob_new = (x_t_target_prob_part_1 * x_t_target_prob_part_2_new) / x_t_target_prob_part_3_new
-
-            sum_x_t_target_prob += x_t_source_prob_new[..., 1] * x0_pred_prob[..., 1]
-
-            p_theta = torch.cat((1 - sum_x_t_target_prob.unsqueeze(-1), sum_x_t_target_prob.unsqueeze(-1)), dim=-1)
-            p_phi = torch.exp(-xt_grad)
-            if self.sparse:
-                p_phi = p_phi.reshape(p_theta.shape)
-            posterior = (p_theta * p_phi) / torch.sum((p_theta * p_phi), dim=-1, keepdim=True)
-            posterior = torch.nan_to_num(posterior, nan=0.5, posinf=0.5, neginf=0.5)
-            posterior = posterior.clamp_min(0.0)
-            posterior = posterior / posterior.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-
-            if target_t > 0:
-                p1 = torch.nan_to_num(posterior[..., 1], nan=0.5, posinf=0.5, neginf=0.5).clamp(0.0, 1.0)
-                xt = torch.bernoulli(p1)
-            else:
-                xt = posterior[..., 1].clamp(min=0.0)
-
-    def duplicate_edge_index(self, parallel_sampling, edge_index, num_nodes, device):
-        """Duplicate the edge index (in sparse graphs) for parallel sampling."""
-        edge_index = edge_index.reshape((2, 1, -1))
-        edge_index_indent = torch.arange(0, parallel_sampling).view(1, -1, 1).to(device)
-        edge_index_indent = edge_index_indent * num_nodes
-        edge_index = edge_index + edge_index_indent
-        edge_index = edge_index.reshape((2, -1))
-        return edge_index
 
     def train_dataloader(self):
         batch_size = self.args.batch_size
@@ -447,37 +234,6 @@ class VRPAssignMetaModel(COMetaModel):
                     f"Available attrs: {dir(self.diffusion)}"
                 )
 
-    def q_sample_edge(self, x0_edge: torch.Tensor, t_edge: torch.Tensor,
-                      active_edge: torch.Tensor = None) -> torch.Tensor:
-        """
-        Sample x_t ~ q(x_t | x0) using Q_bar (binary edge diffusion).
-        """
-        device = x0_edge.device
-        self._ensure_diffusion_mats(device)
-
-        T = int(self.diffusion.T)
-        t_edge = t_edge.long().clamp_(0, T)
-        x0 = x0_edge.long().clamp_(0, 1)
-
-        x0_oh = F.one_hot(x0, num_classes=2).float()  # (E, 2)
-        Qb = self._Q_bar_torch.index_select(0, t_edge)  # (E, 2, 2)
-        p = torch.bmm(x0_oh.unsqueeze(1), Qb).squeeze(1)  # (E, 2)
-
-        p = torch.nan_to_num(p, nan=0.5, posinf=1.0, neginf=0.0)
-        p = p.clamp_min(0.0)
-        p = p / p.sum(dim=-1, keepdim=True).clamp_min(1e-12)
-
-        xt = torch.bernoulli(p[:, 1].clamp(0.0, 1.0)).float()
-        if active_edge is not None:
-            xt = xt * active_edge.float()
-        return xt
-
-    def _posterior_sample_binary(self, xt: torch.Tensor, t: int, target_t: int, p0: torch.Tensor):
-        xt_next, prob = self.categorical_posterior(target_t=target_t, t=t, x0_pred_prob=torch.stack([1.0 - p0, p0], dim=-1), xt=xt.long())
-        if xt_next.dim() > prob.dim():
-            xt_next = xt_next[..., 1]
-        return xt_next.float(), prob.float()
-
     def forward(self, graph, xt_edge: torch.Tensor, t_graph: torch.Tensor):
         return self.model(graph, xt_edge, t_graph)
 
@@ -497,15 +253,6 @@ class VRPAssignMetaModel(COMetaModel):
 
         return self.model(graph, xt_edge, t_edge)
 
-    # def _build_assignment_model(self):
-    #     backbone_name = str(getattr(self.args, "assignment_backbone", "hf_full")).lower()
-    #
-    #     if backbone_name == "hf_lite":
-    #         from .models.gnn import EdgeBipartiteDenoiserHF_Lite as Backbone
-    #     elif backbone_name == "hf_lite_edgeupd":
-    #         from .models.gnn import EdgeBipartiteDenoiserHF_Lite_EdgeUpd as Backbone
-    #     else:
-    #         from .models.gnn import EdgeBipartiteDenoiser as Backbone
 
     def _build_assignment_model(self):
         import inspect
@@ -516,9 +263,9 @@ class VRPAssignMetaModel(COMetaModel):
         # -------- choose backbone class --------
         if task_name in ["hfvrp", "hfvrp_node", "hfvrp_node_assign"]:
             if backbone_name == "hf_lite":
-                from .models.gnn_HF import EdgeBipartiteDenoiserV4_HF_Lite as Backbone
+                from .models.gnn_HF import EdgeBipartiteDenoiser_HF as Backbone
             elif backbone_name == "hf_lite_edgeupd":
-                from .models.gnn_HF import EdgeBipartiteDenoiserV4_HF_Lite_EdgeUpd as Backbone
+                from .models.gnn_HF import EdgeBipartiteDenoiser_HF_EdgeUpd as Backbone
             else:
                 # keep original A-full HF backbone
                 from .models.gnn import EdgeBipartiteDenoiser as Backbone
@@ -681,63 +428,130 @@ class VRPAssignMetaModel(COMetaModel):
             'demands': demands,
         }
 
+    def _slot_counts_and_active_edges(self, graph, common: dict):
+        if self.consistency_tools is None:
+            raise RuntimeError("consistency_tools is required for row-categorical evaluation.")
+
+        _, _, _, _, active_edge, k_graph, _ = self.consistency_tools._batch_structure(
+            graph,
+            common["src"],
+            common["dst"],
+            int(common["B"]),
+            self.device,
+        )
+        return k_graph.long(), active_edge.bool()
+
+    def _row_labels_to_edge_state(
+            self,
+            y_row_flat: torch.Tensor,
+            active_edge: torch.Tensor,
+            common: dict,
+    ):
+        dst = common["dst"].long()
+        veh_local = common["veh_local"].long()
+        return (veh_local == y_row_flat[dst]).float() * active_edge.float()
+
+    def _sample_initial_row_labels(
+            self,
+            graph,
+            common: dict,
+            K_per_graph: torch.Tensor,
+            *,
+            device,
+            batch_idx: int,
+            deterministic: bool,
+            seed_base: int,
+    ):
+        node_batch = graph.node_batch.long().to(device)
+        total_nodes = int(node_batch.numel())
+        y_init = torch.zeros((total_nodes,), device=device, dtype=torch.long)
+
+        if not deterministic:
+            K_node = K_per_graph.long().to(device)[node_batch].clamp_min(1)
+            y = torch.floor(torch.rand((total_nodes,), device=device) * K_node.float()).long()
+            return torch.minimum(torch.clamp_min(y, 0), K_node - 1)
+
+        g_cpu = torch.Generator(device="cpu")
+        g_cpu.manual_seed(int(seed_base) + int(batch_idx))
+
+        B = int(common["B"])
+        for g in range(B):
+            mask = node_batch == int(g)
+            Ng = int(mask.sum().item())
+            Kg = int(K_per_graph[g].item())
+            if Ng <= 0 or Kg <= 0:
+                continue
+            y_init[mask] = torch.randint(Kg, (Ng,), generator=g_cpu, dtype=torch.long).to(device)
+
+        return y_init
+
+    @staticmethod
+    def _rep_indices_for_sample(g0: int, S: int, device):
+        if S <= 1:
+            return torch.tensor([g0], device=device)
+        return torch.arange(g0 * S, (g0 + 1) * S, device=device)
+
 
 
 
     def _edge_prob_from_logits(self, graph, logits: torch.Tensor, active_edge: torch.Tensor, common: dict):
         return torch.sigmoid(logits.float()) * active_edge.float()
 
-    def _run_assignment_diffusion(self, graph, batch_idx: int, split: str, xt: torch.Tensor, active_edge: torch.Tensor, common: dict):
+    def _run_assignment_diffusion(
+            self,
+            graph,
+            batch_idx: int,
+            split: str,
+            xt: torch.Tensor,
+            active_edge: torch.Tensor,
+            common: dict,
+    ):
         from .utils.diffusion_schedulers import InferenceSchedule
+
+        del batch_idx, split
+
         device = self.device
-        B = common['B']
-        infer_T = int(getattr(self.args, 'inference_diffusion_steps', 50))
-        schedule = InferenceSchedule(inference_schedule=self.args.inference_schedule, T=self.diffusion.T, inference_T=infer_T)
+        B = int(common["B"])
+
+        if self.consistency_tools is None or not hasattr(
+                self.consistency_tools,
+                "cm_project_resample_step",
+        ):
+            raise RuntimeError(
+                "Row-categorical assignment diffusion requires consistency_tools.cm_project_resample_step()."
+            )
+
+        infer_T = int(getattr(self.args, "inference_diffusion_steps", 50))
+        schedule = InferenceSchedule(
+            inference_schedule=self.args.inference_schedule,
+            T=self.diffusion.T,
+            inference_T=infer_T,
+        )
+
         last_p1 = None
-        cm_debug = bool(getattr(self.args, 'cm_debug_guidance', False))
-        guide_total_sum = 0.0
-        guide_cap_sum = 0.0
-        guide_sim_sum = 0.0
-        guide_steps = 0
+
         for i in range(infer_T):
             t1, t2 = schedule(i)
-            t1 = int(t1)
-            t2 = int(t2)
-            t_graph = torch.full((B,), t1, device=device, dtype=torch.long)
-            if self.consistency_tools is not None and hasattr(self.consistency_tools, 'cm_project_resample_step'):
-                xt, p1, cm_info = self.consistency_tools.cm_project_resample_step(
-                    self, graph, xt, t_graph, t2, active_edge, step_idx=i, total_steps=infer_T
-                )
-                guide_losses = cm_info.get('guide_losses', None) if isinstance(cm_info, dict) else None
-                if cm_debug and guide_losses is not None:
-                    guide_total_sum += float(guide_losses['total'].item())
-                    guide_cap_sum += float(guide_losses['cap'].item())
-                    guide_sim_sum += float(guide_losses['sim'].item())
-                    if float(cm_info.get('guide_scale', 0.0)) > 0:
-                        guide_steps += 1
-                last_p1 = p1
-            else:
-                xt_in = xt * 2.0 - 1.0
-                logits = self.forward(graph, xt_in, t_graph)
-                p1 = self._edge_prob_from_logits(graph, logits, active_edge, common)
-                last_p1 = p1
-                if t2 > 0:
-                    xt, _ = self._posterior_sample_binary(xt, t1, t2, p1)
-                    xt = xt * active_edge.float()
-                else:
-                    xt = p1
-            if t2 <= 0:
+            t_graph = torch.full((B,), int(t1), device=device, dtype=torch.long)
+
+            xt, p1, _ = self.consistency_tools.cm_project_resample_step(
+                self,
+                graph,
+                xt,
+                t_graph,
+                int(t2),
+                active_edge,
+                step_idx=i,
+                total_steps=infer_T,
+            )
+            last_p1 = p1
+
+            if int(t2) <= 0:
                 break
+
         if last_p1 is None:
-            last_p1 = xt.float() * active_edge.float()
-            denom = torch.zeros((graph.node_features.size(0),), device=device, dtype=last_p1.dtype)
-            denom.index_add_(0, common['dst'], last_p1)
-            last_p1 = last_p1 / denom[common['dst']].clamp_min(1e-12)
-            last_p1 = torch.nan_to_num(last_p1, nan=0.0, posinf=0.0, neginf=0.0)
-        if cm_debug and guide_steps > 0:
-            self.log(f'{split}/cm_guide_total', torch.tensor(guide_total_sum / guide_steps, device=device), prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
-            self.log(f'{split}/cm_guide_cap', torch.tensor(guide_cap_sum / guide_steps, device=device), prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
-            self.log(f'{split}/cm_guide_sim', torch.tensor(guide_sim_sum / guide_steps, device=device), prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
+            raise RuntimeError("Assignment diffusion produced no probability output.")
+
         return last_p1
 
     def _dense_prob_from_edges(self, graph, last_p1: torch.Tensor, active_edge: torch.Tensor, common: dict, K_per_graph: torch.Tensor):

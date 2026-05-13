@@ -99,7 +99,6 @@ def build_bipartite_edge_data(
     seed: int = 1234,
     instance_id: int = 0,
     keep_raw: bool = False,
-    dbg: bool = False,
     knn_k: int = 8,
 ) -> CVRPVehNodeData:
     """Build a Kmax-based bipartite CVRP graph aligned with EdgeBipartiteDenoiserV4.
@@ -296,11 +295,6 @@ def build_bipartite_edge_data(
         data.actions = torch.from_numpy(actions.astype(np.int64))
         data.demand_full = torch.from_numpy(np.concatenate([[0.0], demand]).astype(np.float32))
 
-    if dbg:
-        print("[DBG] V,N,K_ref_used,K_graph,E:", V, N, K_ref_used, K_graph, int(edge_index.shape[1]))
-        for k, v in data.__dict__.items():
-            if torch.is_tensor(v):
-                print("[DBG]", k, tuple(v.shape), v.dtype)
 
     return data
 
@@ -318,7 +312,7 @@ class CVRPNPZVehNodeDataset(Dataset):
         knn_k: int = 8,
     ):
         self.path = npz_path
-        self.data = np.load(npz_path, allow_pickle=True)
+        self.data = np.load(npz_path, allow_pickle=False)
 
         if K_max is None or int(K_max) <= 0:
             raise ValueError(
