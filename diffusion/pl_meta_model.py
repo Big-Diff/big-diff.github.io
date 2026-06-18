@@ -165,7 +165,6 @@ class VRPAssignMetaModel(COMetaModel):
         self._Q_torch = None
         self.consistency_tools = None
         self.decode_cfg = None
-        self._reset_solve_time_meter()
 
     # ---------- generic helpers ----------
     @staticmethod
@@ -175,41 +174,6 @@ class VRPAssignMetaModel(COMetaModel):
         if B > 1:
             starts[1:] = torch.cumsum(cnt, dim=0)[:-1]
         return starts
-
-    def _timing_enabled(self, split: str, do_cost: bool) -> bool:
-        if not bool(getattr(self.args, 'report_time', False)):
-            return False
-        mode = str(getattr(self.args, 'report_time_split', 'test')).lower().strip()
-        if mode not in {'test', 'val', 'all'}:
-            mode = 'test'
-        if mode != 'all' and str(split).lower() != mode:
-            return False
-        only_cost = bool(getattr(self.args, 'report_time_only_cost', True))
-        if only_cost and (not bool(do_cost)):
-            return False
-        return True
-
-    def _reset_solve_time_meter(self):
-        self._solve_time_ms_sum = 0.0
-        self._solve_time_inst = 0
-
-    def on_test_epoch_start(self):
-        self._reset_solve_time_meter()
-
-    def on_validation_epoch_start(self):
-        self._reset_solve_time_meter()
-
-    def on_test_epoch_end(self):
-        if self._solve_time_inst > 0:
-            mean_ms = self._solve_time_ms_sum / float(self._solve_time_inst)
-            self.log('test/solve_time_ms', torch.tensor(mean_ms, device=self.device), prog_bar=True, on_step=False, on_epoch=True, sync_dist=True)
-            print(f'[time][test] solve_time_ms/inst = {mean_ms:.3f}')
-
-    def on_validation_epoch_end(self):
-        if self._solve_time_inst > 0:
-            mean_ms = self._solve_time_ms_sum / float(self._solve_time_inst)
-            self.log('val/solve_time_ms', torch.tensor(mean_ms, device=self.device), prog_bar=False, on_step=False, on_epoch=True, sync_dist=True)
-            print(f'[time][val] solve_time_ms/inst = {mean_ms:.3f}')
 
     def _ensure_diffusion_mats(self, device):
         # Q_bar: (T+1, 2, 2)
@@ -253,24 +217,18 @@ class VRPAssignMetaModel(COMetaModel):
 
         return self.model(graph, xt_edge, t_edge)
 
-
     def _build_assignment_model(self):
-        import inspect
-
         task_name = str(getattr(self.args, "task", "")).lower()
         backbone_name = str(getattr(self.args, "assignment_backbone", "hf_full")).lower()
 
-        # -------- choose backbone class --------
-        if task_name in ["hfvrp", "hfvrp_node", "hfvrp_node_assign"]:
-            if backbone_name == "hf_lite":
-                from .models.gnn_HF import EdgeBipartiteDenoiser_HF as Backbone
-            elif backbone_name == "hf_lite_edgeupd":
+        is_hf = task_name in ["hfvrp", "hfvrp_node", "hfvrp_node_assign"]
+
+        if is_hf:
+            if backbone_name == "hf_lite_edgeupd":
                 from .models.gnn_HF import EdgeBipartiteDenoiser_HF_EdgeUpd as Backbone
             else:
-                # keep original A-full HF backbone
-                from .models.gnn import EdgeBipartiteDenoiser as Backbone
+                from .models.gnn_HF import EdgeBipartiteDenoiser_HF as Backbone
         else:
-            # CVRP and other old paths keep using original gnn.py
             from .models.gnn import EdgeBipartiteDenoiser as Backbone
 
         hidden = int(getattr(self.args, "hidden_dim", 192))
@@ -288,23 +246,11 @@ class VRPAssignMetaModel(COMetaModel):
         veh_in = int(getattr(self.args, "veh_in_dim", 7))
         edge_in = int(getattr(self.args, "edge_in_dim", 8))
 
-        # CVRP current gnn.py / dataset graph_feat is 6-dim.
-        # HF-lite variants may use richer graph features, so keep at least 10 there.
-        if task_name in ["hfvrp", "hfvrp_node", "hfvrp_node_assign"] and backbone_name in ["hf_lite",
-                                                                                           "hf_lite_edgeupd"]:
-            graph_in = int(getattr(self.args, "graph_in_dim", 10))
+        graph_in = int(getattr(self.args, "graph_in_dim", 10 if is_hf else 6))
+        if is_hf:
             graph_in = max(graph_in, 10)
-        else:
-            graph_in = int(getattr(self.args, "graph_in_dim", 6))
 
-        use_n2n = bool(getattr(self.args, "use_n2n", True))
-        use_global = bool(getattr(self.args, "use_global", True))
-        use_adaln = bool(getattr(self.args, "use_adaln", False))
-
-        dyn_refresh_every = int(getattr(self.args, "dyn_refresh_every", 2))
-        intra_every = int(getattr(self.args, "intra_every", 2))
-
-        kwargs = dict(
+        return Backbone(
             node_in_dim=node_in,
             veh_in_dim=veh_in,
             edge_in_dim=edge_in,
@@ -316,81 +262,14 @@ class VRPAssignMetaModel(COMetaModel):
             biattn_heads=biattn_heads,
             biattn_dropout=biattn_dropout,
             biattn_head_dim=biattn_head_dim,
-            use_n2n=use_n2n,
-            use_global=use_global,
-            use_adaln=use_adaln,
             n2n_knn_k=int(getattr(self.args, "n2n_knn_k", 8)),
-            dyn_refresh_every=dyn_refresh_every,
-            intra_every=intra_every,
+            n2n_attn_heads=int(getattr(self.args, "n2n_attn_heads", 4)),
+            n2n_attn_dropout=float(getattr(self.args, "n2n_attn_dropout", 0.05)),
+            n2n_attn_ffn_mult=int(getattr(self.args, "n2n_attn_ffn_mult", 2)),
+            v2v_heads=int(getattr(self.args, "v2v_heads", 4)),
+            v2v_dropout=float(getattr(self.args, "v2v_dropout", 0.05)),
+            v2v_ffn_mult=int(getattr(self.args, "v2v_ffn_mult", 2)),
         )
-
-        # Optional v2v slot-attention. These keys are filtered below, so older
-        # HF backbones that do not support them will not crash.
-        kwargs.update(
-            dict(
-                use_v2v=bool(getattr(self.args, "use_v2v", False)),
-                v2v_every=int(getattr(self.args, "v2v_every", 2)),
-                v2v_heads=int(getattr(self.args, "v2v_heads", 4)),
-                v2v_dropout=float(getattr(self.args, "v2v_dropout", 0.05)),
-                v2v_ffn_mult=int(getattr(self.args, "v2v_ffn_mult", 2)),
-                n2n_mode=str(getattr(self.args, "n2n_mode", "gated")),
-                n2n_attn_heads=int(getattr(self.args, "n2n_attn_heads", 4)),
-                n2n_attn_dropout=float(getattr(self.args, "n2n_attn_dropout", 0.05)),
-                n2n_attn_ffn_mult=int(getattr(self.args, "n2n_attn_ffn_mult", 2)),
-            )
-        )
-
-        # Keep compatibility with HF/CVRP backbones that do not yet expose the new
-        # v2v keyword arguments.
-        sig = inspect.signature(Backbone.__init__)
-        valid_keys = set(sig.parameters.keys())
-        kwargs = {k: v for k, v in kwargs.items() if k in valid_keys}
-
-        return Backbone(**kwargs)
-
-
-        # hidden = int(getattr(self.args, 'hidden_dim', 192))
-        # n_layers = int(getattr(self.args, 'gnn_layers', 4))
-        # time_dim = int(getattr(self.args, 'time_dim', 128))
-        # dropout = float(getattr(self.args, 'dropout', 0.0))
-        #
-        # biattn_heads = int(getattr(self.args, 'biattn_heads', 4))
-        # biattn_dropout = float(getattr(self.args, 'biattn_dropout', 0.0))
-        # biattn_head_dim = getattr(self.args, 'biattn_head_dim', None)
-        # if biattn_head_dim is not None:
-        #     biattn_head_dim = int(biattn_head_dim)
-        #
-        # node_in = int(getattr(self.args, 'node_in_dim', 10))
-        # veh_in = int(getattr(self.args, 'veh_in_dim', 7))
-        # edge_in = int(getattr(self.args, 'edge_in_dim', 8))
-        # graph_in = int(getattr(self.args, 'graph_in_dim', 10))
-        #
-        # use_n2n = bool(getattr(self.args, 'use_n2n', True))
-        # use_global = bool(getattr(self.args, 'use_global', True))
-        # use_adaln = bool(getattr(self.args, 'use_adaln', False))
-        #
-        # dyn_refresh_every = int(getattr(self.args, 'dyn_refresh_every', 2))
-        # intra_every = int(getattr(self.args, 'intra_every', 2))
-        #
-        # return Backbone(
-        #     node_in_dim=node_in,
-        #     veh_in_dim=veh_in,
-        #     edge_in_dim=edge_in,
-        #     graph_in_dim=graph_in,
-        #     hidden_dim=hidden,
-        #     n_layers=n_layers,
-        #     time_dim=time_dim,
-        #     dropout=dropout,
-        #     biattn_heads=biattn_heads,
-        #     biattn_dropout=biattn_dropout,
-        #     biattn_head_dim=biattn_head_dim,
-        #     use_n2n=use_n2n,
-        #     use_global=use_global,
-        #     use_adaln=use_adaln,
-        #     n2n_knn_k=int(getattr(self.args, 'n2n_knn_k', 8)),
-        #     dyn_refresh_every=dyn_refresh_every,
-        #     intra_every=intra_every,
-        # )
     def _prepare_graph_common(self, graph):
         device = self.device
         node_batch = graph.node_batch.long().to(device)
@@ -577,10 +456,21 @@ class VRPAssignMetaModel(COMetaModel):
         graph = batch.to(self.device)
         if self.consistency_tools is None or not hasattr(self.consistency_tools, 'consistency_losses'):
             return self.categorical_training_step(batch, batch_idx)
+
         loss = self.consistency_tools.consistency_losses(self, graph)
         if loss is None:
             raise RuntimeError('consistency_training_step got loss=None.')
-        self.log('train/loss', loss, prog_bar=True, on_step=True, on_epoch=True, sync_dist=True)
+
+        bs = int(getattr(graph, "num_graphs", 0) or getattr(self.args, "batch_size", 1))
+        self.log(
+            'train/loss',
+            loss,
+            prog_bar=True,
+            on_step=True,
+            on_epoch=True,
+            sync_dist=True,
+            batch_size=bs,
+        )
         return loss
 
     def training_step(self, batch, batch_idx):

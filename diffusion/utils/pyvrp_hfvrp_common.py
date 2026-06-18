@@ -510,29 +510,67 @@ def neighbour_stats(neighbours: Sequence[Sequence[int]], *, num_clients: Optiona
 
 
 def official_operator_classes() -> List[Any]:
-    """Return PyVRP 0.13.3 official local-search operators."""
-    from pyvrp.search import NODE_OPERATORS
+    """Return PyVRP's official operator list for the installed version."""
 
-    return list(NODE_OPERATORS)
+    from pyvrp import search as s
+
+    if hasattr(s, "OPERATORS"):
+        return list(getattr(s, "OPERATORS"))
+
+    classes: List[Any] = []
+    for attr in ("NODE_OPERATORS", "ROUTE_OPERATORS"):
+        if hasattr(s, attr):
+            classes.extend(list(getattr(s, attr)))
+    if not classes:
+        raise RuntimeError("No official PyVRP operator list found in pyvrp.search")
+    return classes
+
 
 def add_operators_to_local_search(
     ls: Any,
     data: Any,
     operator_classes: Optional[Iterable[Any]] = None,
 ) -> List[str]:
-    """Add PyVRP 0.13.3 node operators to LocalSearch."""
+    """Add an explicit operator list to LocalSearch, with version fallbacks."""
+
     ops = list(operator_classes) if operator_classes is not None else official_operator_classes()
     added: List[str] = []
 
     for op_cls in ops:
         name = getattr(op_cls, "__name__", str(op_cls))
-        ls.add_node_operator(op_cls(data))
-        added.append(str(name))
+        try:
+            op = op_cls(data)
+        except Exception:
+            continue
+
+        ok = False
+        if hasattr(ls, "add_operator"):
+            try:
+                ls.add_operator(op)
+                ok = True
+            except Exception:
+                ok = False
+
+        if not ok and hasattr(ls, "add_node_operator"):
+            try:
+                ls.add_node_operator(op)
+                ok = True
+            except Exception:
+                ok = False
+
+        if not ok and hasattr(ls, "add_route_operator"):
+            try:
+                ls.add_route_operator(op)
+                ok = True
+            except Exception:
+                ok = False
+
+        if ok:
+            added.append(str(name))
 
     if not added:
-        raise RuntimeError("No PyVRP local-search operators were added.")
+        raise RuntimeError("No PyVRP operators could be added to LocalSearch")
     return added
-
 
 def make_local_search(
     data: Any,
@@ -582,44 +620,39 @@ def run_component_ils(
     from pyvrp.stop import MaxRuntime
 
     t0 = time.perf_counter()
-    try:
-        rng = RandomNumberGenerator(seed=int(config.seed))
-        ls, added_ops = make_local_search(
-            data,
-            rng,
-            neighbours,
-            operator_classes=operator_classes,
-        )
-        penalty_manager = PenaltyManager.init_from(data)
-        params = _make_ils_params(config)
-        algo = IteratedLocalSearch(data, penalty_manager, rng, ls, init_sol, params)
-        stop = MaxRuntime(max(1e-3, float(config.budget_ms) / 1000.0))
 
-        result = algo.run(
-            stop=stop,
-            collect_stats=bool(config.collect_stats),
-            display=bool(config.display),
-            display_interval=float(config.display_interval),
-        )
-        best = result.best
+    rng = RandomNumberGenerator(seed=int(config.seed))
+    ls, added_ops = make_local_search(
+        data,
+        rng,
+        neighbours,
+        operator_classes=operator_classes,
+    )
 
-        return HFPyVRPResult(
-            status="ok",
-            solution=best,
-            pyvrp_result=result,
-            pyvrp_cost=float(result.cost()),
-            is_feasible=bool(result.is_feasible()),
-            elapsed_ms=(time.perf_counter() - t0) * 1000.0,
-            operators=added_ops,
-            neighbourhood_stats=neighbour_stats(neighbours),
-        )
-    except Exception:
-        return HFPyVRPResult(
-            status="exception",
-            elapsed_ms=(time.perf_counter() - t0) * 1000.0,
-            neighbourhood_stats=neighbour_stats(neighbours),
-            exception_text=traceback.format_exc(),
-        )
+    penalty_manager = PenaltyManager.init_from(data)
+    params = _make_ils_params(config)
+    algo = IteratedLocalSearch(data, penalty_manager, rng, ls, init_sol, params)
+    stop = MaxRuntime(max(1e-3, float(config.budget_ms) / 1000.0))
+
+    result = algo.run(
+        stop=stop,
+        collect_stats=bool(config.collect_stats),
+        display=bool(config.display),
+        display_interval=float(config.display_interval),
+    )
+
+    best = result.best
+
+    return HFPyVRPResult(
+        status="ok",
+        solution=best,
+        pyvrp_result=result,
+        pyvrp_cost=float(result.cost()),
+        is_feasible=bool(result.is_feasible()),
+        elapsed_ms=(time.perf_counter() - t0) * 1000.0,
+        operators=added_ops,
+        neighbourhood_stats={},
+    )
 
 
 # ---------------------------------------------------------------------------

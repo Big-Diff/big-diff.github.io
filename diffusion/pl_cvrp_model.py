@@ -10,14 +10,13 @@ import argparse
 import numpy as np
 import torch
 import os
-import time
 from torch_geometric.data import Batch as PyGBatch
 import torch.nn.functional as F
 from diffusion.co_datasets.cvrp_dataset import CVRPNPZVehNodeDataset
 from diffusion.co_datasets.memmap_dataset import CVRPMemmapVehNodeDataset
 from diffusion.consistency.cvrp import CVRPConsistency
 from .pl_meta_model import VRPAssignMetaModel
-from .utils.cvrp_decoder import READDecodeCfg, decode_read_batch_struct
+from .utils.cvrp_decoder import READDecodeCfg, construct_seed_batch, refine_seed_batch
 from torch.utils.data import Subset
 
 
@@ -130,6 +129,44 @@ class CVRPNodeAssignModel(VRPAssignMetaModel):
     def categorical_training_step(self, batch, batch_idx):
         raise RuntimeError('CVRP categorical_training_step() is intentionally disabled. Set --consistency and train through CVRPConsistency.consistency_losses().')
 
+    def _perm_invariant_acc(
+            self,
+            pred_y: torch.Tensor,
+            gt_y: torch.Tensor,
+            Ku_g: int,
+    ) -> float:
+        if pred_y.numel() == 0:
+            return 0.0
+
+        Ku_g = int(Ku_g)
+        if Ku_g <= 1:
+            return float((pred_y == gt_y).float().mean().item())
+
+        pred_y = pred_y.long().clamp(0, Ku_g - 1)
+        gt_y = gt_y.long().clamp(0, Ku_g - 1)
+
+        conf = torch.zeros((Ku_g, Ku_g), device=pred_y.device, dtype=torch.float32)
+
+        for t in range(Ku_g):
+            mask = gt_y == t
+            if bool(mask.any()):
+                cnt = torch.bincount(pred_y[mask], minlength=Ku_g).float()
+                conf[t] = cnt
+
+        try:
+            import scipy.optimize as opt
+
+            row_ind, col_ind = opt.linear_sum_assignment(
+                (-conf).detach().cpu().numpy()
+            )
+            row_ind = torch.as_tensor(row_ind, device=conf.device, dtype=torch.long)
+            col_ind = torch.as_tensor(col_ind, device=conf.device, dtype=torch.long)
+            matched = conf[row_ind, col_ind].sum().item()
+        except Exception:
+            matched = conf.max(dim=1).values.sum().item()
+
+        return float(matched / max(1, int(pred_y.numel())))
+
     def _eval_bipartite_stage_a(self, batch, batch_idx: int, split: str):
         device = self.device
 
@@ -146,12 +183,8 @@ class CVRPNodeAssignModel(VRPAssignMetaModel):
                     and batch_idx < max(0, eval_cost_batches)
             )
 
-        # Final paper path: skipped cost-eval batches produce no public metric.
-        # Do not run diffusion, construct jobs, or select replicas by NLL.
-        if not do_cost:
-            return
 
-        S = S_req
+        S = S_req if do_cost else 1
 
         if bool(getattr(self.args, "eval_deterministic", False)):
             seed = int(getattr(self.args, "eval_seed", 12345)) + int(batch_idx)
@@ -183,10 +216,7 @@ class CVRPNodeAssignModel(VRPAssignMetaModel):
             B = B0
 
         common = self._prepare_graph_common(graph)
-
-        # Strict Kmax evaluation: use the slot semantics defined by CVRPConsistency.
         veh_cnt, active_edge = self._slot_counts_and_active_edges(graph, common)
-        common["K_active"] = veh_cnt
 
         y_init = self._sample_initial_row_labels(
             graph,
@@ -203,13 +233,6 @@ class CVRPNodeAssignModel(VRPAssignMetaModel):
             active_edge,
             common,
         ).clamp(0.0, 1.0)
-
-        _do_timing = self._timing_enabled(split, do_cost)
-        _t0 = None
-        if _do_timing:
-            if torch.cuda.is_available():
-                torch.cuda.synchronize(device)
-            _t0 = time.perf_counter()
 
         last_p1 = self._run_assignment_diffusion(
             graph,
@@ -228,7 +251,18 @@ class CVRPNodeAssignModel(VRPAssignMetaModel):
             veh_cnt,
         )
 
-        rep_cost = torch.full((B,), float("inf"), device=device)
+        logits_lab_all = torch.argmax(prob_bnK, dim=2)
+
+        rep_seed_lab = [None] * B
+        rep_final_lab = [None] * B
+        rep_seed_routes = [None] * B
+        rep_cost_stagea = torch.full((B,), float("inf"), device=device)
+        rep_cost_refined = torch.full((B,), float("inf"), device=device)
+        rep_nll_seed = torch.full((B,), float("inf"), device=device)
+        rep_nll_final = torch.full((B,), float("inf"), device=device)
+        rep_feas = torch.zeros((B,), device=device, dtype=torch.bool)
+        rep_acc_logits_slot = torch.zeros((B,), device=device)
+        meta = [None] * B
         jobs = [None] * B
 
         cfg = self.decode_cfg
@@ -241,6 +275,24 @@ class CVRPNodeAssignModel(VRPAssignMetaModel):
                 continue
 
             data_g = graph_list[g]
+            gold_g = data_g.y.long().to(device).clamp(0, Kg - 1)
+
+            lab_logits = logits_lab_all[g, :Ng].long()
+            rep_acc_logits_slot[g] = (lab_logits == gold_g).float().mean()
+            meta[g] = (gold_g, data_g, lab_logits)
+
+            if not do_cost:
+                rep_seed_lab[g] = lab_logits
+                rep_final_lab[g] = lab_logits
+
+                chosen_prob = prob_bnK[g, torch.arange(Ng, device=device), lab_logits].clamp_min(1e-12)
+                nll = -torch.log(chosen_prob).sum()
+
+                rep_nll_seed[g] = float(nll.item())
+                rep_nll_final[g] = float(nll.item())
+                rep_feas[g] = True
+                continue
+
             prob_c_t = prob_bnK[g, :Ng, :Kg].detach().cpu()
 
             if hasattr(data_g, "points") and data_g.points is not None:
@@ -269,21 +321,78 @@ class CVRPNodeAssignModel(VRPAssignMetaModel):
                 "seed": int(decode_seed_base + g),
             }
 
-        valid_jobs = [(i, j) for i, j in enumerate(jobs) if j is not None]
-        if valid_jobs:
-            decode_out = decode_read_batch_struct(
-                [j for _, j in valid_jobs],
-                max_workers=int(getattr(self.args, "refine_threads", 1)),
-                return_profile=False,
-            )
+        if do_cost:
+            valid_jobs = [(i, j) for i, j in enumerate(jobs) if j is not None]
+            if valid_jobs:
+                seed_out = construct_seed_batch(
+                    [j for _, j in valid_jobs],
+                    max_workers=1,
+                )
 
-            for (g, _), out in zip(valid_jobs, decode_out):
-                cost = float(out.refined_cost)
-                if np.isfinite(cost):
-                    rep_cost[g] = cost
+                for (g, _), out in zip(valid_jobs, seed_out):
+                    rep_seed_lab[g] = out.seed_lab_t.to(device).long()
+                    rep_final_lab[g] = out.seed_lab_t.to(device).long()
+                    rep_seed_routes[g] = out.seed_routes
+                    rep_cost_stagea[g] = float(out.stagea_cost)
+                    rep_cost_refined[g] = float(out.stagea_cost)
+                    rep_nll_seed[g] = float(out.nll_seed)
+                    rep_nll_final[g] = float(out.nll_seed)
+                    rep_feas[g] = bool(torch.isfinite(rep_cost_stagea[g]).item())
 
-        cost_list = []
+                selected_reps = []
+                BIG_SELECT = 1e9
+                for g0 in range(B0):
+                    if S <= 1:
+                        reps = torch.tensor([g0], device=device)
+                    else:
+                        reps = torch.arange(g0 * S, (g0 + 1) * S, device=device)
+
+                    score = rep_cost_stagea[reps] + (~rep_feas[reps]).float() * BIG_SELECT
+                    rep = int(reps[torch.argmin(score)].item())
+                    if (
+                        jobs[rep] is not None
+                        and rep_seed_lab[rep] is not None
+                        and rep_seed_routes[rep] is not None
+                        and bool(rep_feas[rep].item())
+                    ):
+                        selected_reps.append(rep)
+
+                refine_jobs = []
+                for rep in selected_reps:
+                    job = dict(jobs[rep])
+                    job["seed_lab"] = rep_seed_lab[rep].detach().cpu().numpy()
+                    job["seed_routes"] = rep_seed_routes[rep]
+                    refine_jobs.append((rep, job))
+
+                if refine_jobs:
+                    refined_out = refine_seed_batch(
+                        [j for _, j in refine_jobs],
+                        max_workers=1,
+                    )
+
+                    for (rep, _), out in zip(refine_jobs, refined_out):
+                        rep_final_lab[rep] = out.final_lab_t.to(device).long()
+                        rep_cost_stagea[rep] = float(out.stagea_cost)
+                        rep_cost_refined[rep] = float(out.refined_cost)
+                        rep_nll_seed[rep] = float(out.nll_seed)
+                        rep_nll_final[rep] = float(out.nll_final)
+                        rep_feas[rep] = bool(
+                            torch.isfinite(rep_cost_stagea[rep]).item()
+                            and torch.isfinite(rep_cost_refined[rep]).item()
+                        )
+
+        acc_projected_list = []
+        acc_refined_list = []
+        acc_logits_slot_list = []
+        acc_logits_aligned_list = []
+        feas_list = []
+        cost_stagea_list = []
+        cost_refined_list = []
         gt_cost_list = []
+        BIG = 1e9
+
+        instance_rows = []
+        base_local_index = int(getattr(self, "_test_seen_count", 0))
 
         def _rep_indices_for_sample(g0: int):
             if S <= 1:
@@ -292,67 +401,141 @@ class CVRPNodeAssignModel(VRPAssignMetaModel):
 
         for g0 in range(B0):
             reps = _rep_indices_for_sample(g0)
-            rep = int(reps[torch.argmin(rep_cost[reps])].item())
+            score = (rep_cost_refined if do_cost else rep_nll_seed)[reps] + (~rep_feas[reps]).float() * BIG
+            rep = int(reps[torch.argmin(score)].item())
 
-            if torch.isfinite(rep_cost[rep]).item():
-                cost_list.append(rep_cost[rep])
+            if rep_seed_lab[rep] is None or rep_final_lab[rep] is None or meta[rep] is None:
+                continue
 
-                if gt_cost0 is not None and g0 < gt_cost0.numel():
-                    gt_val = gt_cost0[g0]
-                    if torch.isfinite(gt_val):
-                        gt_cost_list.append(gt_val)
+            gold_g, data_g, lab_logits = meta[rep]
+            lab_seed = rep_seed_lab[rep]
+            lab_final = rep_final_lab[rep]
 
+            Kg = (
+                int(
+                    max(
+                        int(gold_g.max().item()) + 1,
+                        int(lab_seed.max().item()) + 1,
+                        int(lab_final.max().item()) + 1,
+                        int(lab_logits.max().item()) + 1,
+                    )
+                ) if gold_g.numel() > 0 else 1
+            )
+
+            feas_list.append(rep_feas[rep].float())
+            acc_projected_list.append(torch.tensor(self._perm_invariant_acc(lab_seed, gold_g, Kg), device=device))
+            acc_refined_list.append(torch.tensor(self._perm_invariant_acc(lab_final, gold_g, Kg), device=device))
+            acc_logits_slot_list.append(rep_acc_logits_slot[rep])
+            acc_logits_aligned_list.append(
+                torch.tensor(self._perm_invariant_acc(lab_logits, gold_g, Kg), device=device)
+            )
+
+            if do_cost and torch.isfinite(rep_cost_stagea[rep]).item() and torch.isfinite(rep_cost_refined[rep]).item():
+                cost_stagea_list.append(rep_cost_stagea[rep])
+                cost_refined_list.append(rep_cost_refined[rep])
+
+            gt_item = None
+            if gt_cost0 is not None and g0 < gt_cost0.numel():
+                gt_val = gt_cost0[g0]
+                if torch.isfinite(gt_val):
+                    gt_cost_list.append(gt_val)
+                    gt_item = float(gt_val.detach().cpu().item())
+
+            if split == "test" and do_cost:
+                stagea_item = float(rep_cost_stagea[rep].detach().cpu().item()) if torch.isfinite(
+                    rep_cost_stagea[rep]).item() else float("inf")
+                refined_item = float(rep_cost_refined[rep].detach().cpu().item()) if torch.isfinite(
+                    rep_cost_refined[rep]).item() else float("inf")
+                feasible_item = bool(rep_feas[rep].detach().cpu().item())
+
+                if gt_item is not None and np.isfinite(gt_item) and gt_item > 1e-8:
+                    gap_stagea_pct = (stagea_item - gt_item) / gt_item * 100.0 if np.isfinite(stagea_item) else float(
+                        "inf")
+                    gap_refined_pct = (refined_item - gt_item) / gt_item * 100.0 if np.isfinite(
+                        refined_item) else float("inf")
+                    abs_gap_refined_pct = abs(gap_refined_pct) if np.isfinite(gap_refined_pct) else float("inf")
+                else:
+                    gap_stagea_pct = None
+                    gap_refined_pct = None
+                    abs_gap_refined_pct = None
+
+                chosen_rep_local = int(rep - g0 * S) if S > 1 else 0
+
+                instance_rows.append({
+                    "rank": int(getattr(self, "global_rank", 0)),
+                    "sample_index_local": int(base_local_index + g0),
+                    "batch_idx": int(batch_idx),
+                    "batch_pos": int(g0),
+                    "chosen_rep": int(chosen_rep_local),
+                    "gt_cost": gt_item,
+                    "stagea_cost": stagea_item,
+                    "refined_cost": refined_item,
+                    "gap_stagea_pct": gap_stagea_pct,
+                    "gap_refined_pct": gap_refined_pct,
+                    "abs_gap_refined_pct": abs_gap_refined_pct,
+                    "feasible": feasible_item,
+                })
+
+        acc_projected = torch.stack(acc_projected_list).mean() if acc_projected_list else torch.tensor(0.0,
+                                                                                                       device=device)
+        acc_refined = torch.stack(acc_refined_list).mean() if acc_refined_list else torch.tensor(0.0, device=device)
+        acc_logits_slot = torch.stack(acc_logits_slot_list).mean() if acc_logits_slot_list else torch.tensor(0.0,
+                                                                                                             device=device)
+        acc_logits_aligned = torch.stack(acc_logits_aligned_list).mean() if acc_logits_aligned_list else torch.tensor(
+            0.0, device=device)
+        feas_rate = torch.stack(feas_list).mean() if feas_list else torch.tensor(0.0, device=device)
         bs_log = int(B0)
 
-        if cost_list:
-            cost_mean = torch.stack(cost_list).mean()
+        self.log(f"{split}/acc", acc_projected, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True,
+                 batch_size=bs_log)
+        self.log(f"{split}/acc_projected", acc_projected, prog_bar=False, on_step=False, on_epoch=True, sync_dist=True,
+                 batch_size=bs_log)
+        self.log(f"{split}/acc_refined", acc_refined, prog_bar=False, on_step=False, on_epoch=True, sync_dist=True,
+                 batch_size=bs_log)
+        self.log(f"{split}/acc_logits_slot", acc_logits_slot, prog_bar=False, on_step=False, on_epoch=True,
+                 sync_dist=True, batch_size=bs_log)
+        self.log(f"{split}/acc_logits_aligned", acc_logits_aligned, prog_bar=False, on_step=False, on_epoch=True,
+                 sync_dist=True, batch_size=bs_log)
+        self.log(f"{split}/feasible_rate", feas_rate, prog_bar=True, on_step=False, on_epoch=True, sync_dist=True,
+                 batch_size=bs_log)
 
-            self.log(
-                f"{split}/cost",
-                cost_mean,
-                prog_bar=True,
-                on_step=False,
-                on_epoch=True,
-                sync_dist=True,
-                batch_size=bs_log,
-            )
+        cost_stagea_mean = None
+        cost_refined_mean = None
+        gt_cost_mean = None
+        if do_cost and cost_stagea_list:
+            cost_stagea_mean = torch.stack(cost_stagea_list).mean()
+            cost_refined_mean = torch.stack(cost_refined_list).mean()
+            self.log(f"{split}/cost_stagea", cost_stagea_mean, prog_bar=False, on_step=False, on_epoch=True,
+                     sync_dist=True, batch_size=bs_log)
+            self.log(f"{split}/cost_refined", cost_refined_mean, prog_bar=False, on_step=False, on_epoch=True,
+                     sync_dist=True, batch_size=bs_log)
 
-            if log_cost_gap and gt_cost_list:
+            if gt_cost_list:
                 gt_cost_tensor = torch.stack(gt_cost_list)
                 gt_cost_tensor = gt_cost_tensor[torch.isfinite(gt_cost_tensor)]
-
                 if gt_cost_tensor.numel() > 0:
-                    gt_cost_mean = gt_cost_tensor.mean().clamp_min(1e-8)
-                    cost_gap = (cost_mean - gt_cost_mean) / gt_cost_mean
+                    gt_cost_mean = gt_cost_tensor.mean()
+                    self.log(f"{split}/gt_cost_raw", gt_cost_mean, prog_bar=False, on_step=False, on_epoch=True,
+                             sync_dist=True, batch_size=bs_log)
 
-                    self.log(
-                        f"{split}/cost_gap",
-                        cost_gap,
-                        prog_bar=False,
-                        on_step=False,
-                        on_epoch=True,
-                        sync_dist=True,
-                        batch_size=bs_log,
-                    )
+                    if log_cost_gap:
+                        denom = gt_cost_mean.clamp_min(1e-8)
+                        gap_stagea = (cost_stagea_mean - gt_cost_mean) / denom
+                        gap_refined = (cost_refined_mean - gt_cost_mean) / denom
+                        self.log(f"{split}/cost_gap_stagea", gap_stagea, prog_bar=False, on_step=False, on_epoch=True,
+                                 sync_dist=True, batch_size=bs_log)
+                        self.log(f"{split}/cost_gap_refined", gap_refined, prog_bar=False, on_step=False, on_epoch=True,
+                                 sync_dist=True, batch_size=bs_log)
 
-            if split == "val":
-                print(f"[CVRP VAL] cost={float(cost_mean.detach().cpu().item()):.5f}")
-
-        else:
-            bad = torch.tensor(float("inf"), device=device)
-            self.log(
-                f"{split}/cost",
-                bad,
-                prog_bar=True,
-                on_step=False,
-                on_epoch=True,
-                sync_dist=True,
-                batch_size=bs_log,
+        if split == "val":
+            print(
+                f"[CVRP VAL SUMMARY] "
+                f"acc={float(acc_projected.detach().cpu().item()):.5f} "
+                f"acc_proj={float(acc_projected.detach().cpu().item()):.5f} "
+                f"acc_ref={float(acc_refined.detach().cpu().item()):.5f} "
+                f"acc_slot={float(acc_logits_slot.detach().cpu().item()):.5f} "
+                f"acc_aligned={float(acc_logits_aligned.detach().cpu().item()):.5f} "
+                f"feas={float(feas_rate.detach().cpu().item()):.5f} "
+                f"cost_stagea={float(cost_stagea_mean.detach().cpu().item()) if cost_stagea_mean is not None else float('inf'):.5f} "
+                f"cost_refined={float(cost_refined_mean.detach().cpu().item()) if cost_refined_mean is not None else float('inf'):.5f}"
             )
-
-        if _do_timing and _t0 is not None:
-            if torch.cuda.is_available():
-                torch.cuda.synchronize(device)
-            elapsed_ms = (time.perf_counter() - _t0) * 1000.0
-            self._solve_time_ms_sum += float(elapsed_ms)
-            self._solve_time_inst += int(B0)

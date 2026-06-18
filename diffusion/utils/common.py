@@ -10,10 +10,13 @@ on the parts of the pipeline they share (Stage B route construction,
 
 from __future__ import annotations
 
-from typing import List, Optional, Tuple
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Any, Callable, List, Optional, Tuple, TypeVar
+import os
 
 import numpy as np
 
+T = TypeVar("T")
 
 # ---------------------------------------------------------------------------
 # Probability post-processing
@@ -35,25 +38,6 @@ def row_normalize(prob: np.ndarray) -> np.ndarray:
         out[bad] = 1.0 / float(max(1, out.shape[1]))
         s = out.sum(axis=1, keepdims=True)
     return out / np.clip(s, 1e-12, None)
-
-
-def uncertainty_stats(prob: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Return ``(p1, p2, margin, normalised_entropy)`` for each row of ``prob``.
-
-    ``margin = p1 - p2`` is the top-1/top-2 confidence gap, and the entropy is
-    divided by ``log(K)`` so that it lives in ``[0, 1]`` regardless of the number
-    of slots.
-    """
-    prob = row_normalize(prob)
-    n, k = prob.shape
-    order = np.argsort(-prob, axis=1)
-    p1 = prob[np.arange(n), order[:, 0]]
-    p2 = prob[np.arange(n), order[:, 1]] if k >= 2 else np.zeros((n,), dtype=np.float32)
-    margin = (p1 - p2).astype(np.float32)
-    ent = -(prob * np.log(np.clip(prob, 1e-12, None))).sum(axis=1).astype(np.float32)
-    if k > 1:
-        ent = ent / float(np.log(k))
-    return p1, p2, margin, ent
 
 
 def nll_from_prob_and_labels(prob: np.ndarray, labels: np.ndarray) -> float:
@@ -84,13 +68,13 @@ def prep_dist_mats(depot_xy: np.ndarray, clients_xy: np.ndarray) -> Tuple[np.nda
     return d0c, dcc
 
 
-def two_opt_improve(route: np.ndarray, dist: np.ndarray, max_iter: int = 64) -> np.ndarray:
+def two_opt_improve(route: np.ndarray, dist: np.ndarray) -> np.ndarray:
     r = np.asarray(route, dtype=np.int64).copy()
     m = int(r.size)
     if m <= 3:
         return r
 
-    for _ in range(int(max_iter)):
+    while True:
         improved = False
 
         for i in range(m - 2):
@@ -114,6 +98,88 @@ def two_opt_improve(route: np.ndarray, dist: np.ndarray, max_iter: int = 64) -> 
             break
 
     return r
+
+def as_numpy(x, *, dtype=None) -> np.ndarray:
+    import torch
+
+    if torch.is_tensor(x):
+        x = x.detach().cpu().numpy()
+    return np.asarray(x, dtype=dtype)
+
+
+def make_decode_result(
+    prob_c,
+    seed_lab: np.ndarray,
+    final_lab: np.ndarray,
+    stagea_cost: float,
+    refined_cost: float,
+    nll_seed: float,
+    nll_final: float,
+    *,
+    seed_routes: List[List[int]],
+    final_routes: List[List[int]],
+) -> Any:
+    import torch
+    from .read_config import READDecodeResult
+
+    target_device = prob_c.device if torch.is_tensor(prob_c) else torch.device("cpu")
+    return READDecodeResult(
+        seed_lab_t=torch.from_numpy(seed_lab.astype(np.int64)).long().to(target_device),
+        final_lab_t=torch.from_numpy(final_lab.astype(np.int64)).long().to(target_device),
+        stagea_cost=float(stagea_cost),
+        refined_cost=float(refined_cost),
+        nll_seed=float(nll_seed),
+        nll_final=float(nll_final),
+        seed_routes=seed_routes,
+        final_routes=final_routes,
+    )
+
+
+def build_read_neighbours(
+    prob_slot: np.ndarray,
+    clients_xy: np.ndarray,
+    *,
+    defaults: Any,
+    dem: Optional[np.ndarray] = None,
+    cap_vec: Optional[np.ndarray] = None,
+    slot_mask: Optional[np.ndarray] = None,
+    prepend_depot: bool = False,
+):
+    from .read_competitive_neighbours import build_heatmap_neighbours
+
+    rows = build_heatmap_neighbours(
+        prob_slot=prob_slot,
+        clients_xy=clients_xy,
+        dem=dem,
+        cap_vec=cap_vec,
+        slot_mask=slot_mask,
+        defaults=defaults,
+    )
+    return [[]] + rows if prepend_depot else rows
+
+
+def decode_jobs_in_threads(
+    jobs: List[dict],
+    worker: Callable[[int, dict], T],
+    *,
+    max_workers: Optional[int] = None,
+    missing_message: str = "decoder batch produced incomplete results.",
+) -> List[T]:
+    if max_workers is None:
+        max_workers = min(8, os.cpu_count() or 8)
+    max_workers = max(1, int(max_workers))
+
+    results: List[Optional[T]] = [None] * len(jobs)
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(worker, i, job): i for i, job in enumerate(jobs)}
+        for future in as_completed(futures):
+            i = futures[future]
+            results[i] = future.result()
+
+    missing = [i for i, result in enumerate(results) if result is None]
+    if missing:
+        raise RuntimeError(f"{missing_message} first missing index={missing[0]}")
+    return results  # type: ignore[return-value]
 
 
 # ---------------------------------------------------------------------------
@@ -193,35 +259,32 @@ def regret_insertion_order(sub: np.ndarray, d0c: np.ndarray, dcc: np.ndarray) ->
 
     return np.asarray(route, dtype=np.int64)
 
-
 def build_seed_routes(
     labels: np.ndarray,
     k: int,
     depot_xy: np.ndarray,
     clients_xy: np.ndarray,
-    *,
-    two_opt: bool = True,
-    two_opt_iter: int = 128,
 ) -> List[List[int]]:
-    """Build one route per slot using regret insertion plus optional 2-opt.
-
-    The returned route lists use 1-indexed client ids (``0`` is reserved for
-    the depot in PyVRP), matching what PyVRP expects.
-    """
+    """Build one deterministic route per slot using regret insertion and 2-opt."""
     labels = np.asarray(labels, dtype=np.int64).reshape(-1)
     k = int(k)
     if k <= 0:
         return []
+
     d0c, dcc = prep_dist_mats(depot_xy, clients_xy)
     routes: List[List[int]] = [[] for _ in range(k)]
+
     for v in range(k):
         sub = np.nonzero(labels == v)[0].astype(np.int64)
         if sub.size == 0:
             continue
+
         order = regret_insertion_order(sub, d0c, dcc)
-        if bool(two_opt) and order.size >= 4:
-            order = two_opt_improve(order, dcc, max_iter=int(two_opt_iter))
+        if order.size >= 4:
+            order = two_opt_improve(order, dcc)
+
         routes[v] = (order + 1).astype(np.int64).tolist()
+
     return routes
 
 # ---------------------------------------------------------------------------
@@ -277,37 +340,3 @@ def run_pyvrp_ils(data, init_sol, neigh, *, seed: int = 0, budget_ms: float = 10
     algo = IteratedLocalSearch(data, pen_manager, rng, ls, init_sol)
     stop = MaxRuntime(max(1e-3, float(budget_ms) / 1000.0))
     return algo.run(stop)
-
-
-# ---------------------------------------------------------------------------
-# Lightweight profiling
-# ---------------------------------------------------------------------------
-
-class StageTimer:
-    """Tiny tic/toc helper that records elapsed wall-clock time per stage in
-    milliseconds. Robust to repeated tic/toc on the same name (unlike the
-    inline pattern used previously, which could double-multiply on re-entry).
-    """
-
-    def __init__(self, enabled: bool = False) -> None:
-        self.enabled = bool(enabled)
-        self._starts: dict = {}
-        self.times_ms: dict = {}
-
-    def tic(self, name: str) -> None:
-        if not self.enabled:
-            return
-        import time
-        self._starts[name] = time.perf_counter()
-
-    def toc(self, name: str) -> None:
-        if not self.enabled:
-            return
-        import time
-        if name not in self._starts:
-            return
-        elapsed = (time.perf_counter() - self._starts.pop(name)) * 1000.0
-        self.times_ms[name] = self.times_ms.get(name, 0.0) + float(elapsed)
-
-    def as_dict(self) -> dict:
-        return dict(self.times_ms)

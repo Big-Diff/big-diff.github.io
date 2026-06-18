@@ -202,7 +202,17 @@ class RowCategoricalConsistencyBase(MetaConsistency):
         starts = torch.cumsum(veh_cnt, 0) - veh_cnt
         veh_local = src.long().to(device) - starts[veh_batch[src.long().to(device)]]
 
-        active_edge = veh_local < ku[edge_graph]
+        base_active = veh_local < ku[edge_graph]
+        extra_active = self._active_edge_mask(
+            graph,
+            src,
+            dst,
+            edge_graph,
+            veh_local,
+            bsz,
+            device,
+        )
+        active_edge = base_active & extra_active
         k_node = ku[node_batch]
 
         return node_batch, veh_batch, edge_graph, veh_local, active_edge, ku, k_node
@@ -540,6 +550,119 @@ class RowCategoricalConsistencyBase(MetaConsistency):
         return kl.mean()
 
     @staticmethod
+    def _sanitize_logits(logits: torch.Tensor, clamp: float = 20.0) -> torch.Tensor:
+        return torch.nan_to_num(
+            logits.float(),
+            nan=0.0,
+            posinf=clamp,
+            neginf=-clamp,
+        ).clamp(-clamp, clamp)
+
+    def _two_time_row_outputs(self, model, graph):
+        device = model.device
+        graph = graph.to(device)
+
+        node_batch = graph.node_batch.long().to(device)
+        edge_index = graph.edge_index.long().to(device)
+        src, dst = edge_index[0], edge_index[1]
+        edge_graph = node_batch[dst]
+
+        bsz = int(getattr(graph, "num_graphs", 0) or 0)
+        if bsz <= 0:
+            bsz = int(edge_graph.max().item()) + 1 if edge_graph.numel() > 0 else 0
+
+        if bsz <= 0:
+            return None
+
+        _, _, edge_graph, veh_local, active_edge, _, k_node = self._batch_structure(
+            graph, src, dst, bsz, device
+        )
+
+        if not bool(active_edge.any()):
+            return None
+
+        y0_row = graph.y.view(-1).long().to(device)
+        y0_row = torch.minimum(torch.clamp_min(y0_row, 0), k_node - 1)
+
+        t_max = int(model.diffusion.T)
+        t_graph = torch.randint(1, t_max + 1, (bsz,), device=device)
+        t2_graph = (
+            float(getattr(model.args, "alpha", 0.5)) * t_graph.float()
+        ).long().clamp(min=0)
+
+        t_node = t_graph[node_batch]
+        t2_node = t2_graph[node_batch]
+
+        y_t = self.q_sample_row(
+            y0_row=y0_row,
+            t_node=t_node,
+            k_node=k_node,
+            diffusion=model.diffusion,
+        )
+        y_t2 = self.q_sample_row(
+            y0_row=y0_row,
+            t_node=t2_node,
+            k_node=k_node,
+            diffusion=model.diffusion,
+        )
+
+        x_t_edge = self._edge_onehot_from_row(y_t, veh_local, dst, active_edge)
+        x_t2_edge = self._edge_onehot_from_row(y_t2, veh_local, dst, active_edge)
+
+        xt_in = self._edge_logits_to_input(x_t_edge)
+        xt2_in = self._edge_logits_to_input(x_t2_edge)
+
+        with torch.amp.autocast(device_type=device.type, enabled=False):
+            logits_t = model.forward(graph, xt_in.float(), t_graph)
+            logits_t2 = model.forward(graph, xt2_in.float(), t2_graph)
+
+        logits_t = self._sanitize_logits(logits_t)
+        logits_t2 = self._sanitize_logits(logits_t2)
+
+        row_ce_t = self._row_ce_from_logits(
+            graph, logits_t, active_edge, src, dst, edge_graph, bsz, device
+        )
+        row_ce_t2 = self._row_ce_from_logits(
+            graph, logits_t2, active_edge, src, dst, edge_graph, bsz, device
+        )
+
+        _, row_prob_t, _ = self._row_prob_from_logits(
+            graph, logits_t, active_edge, src, dst, veh_local, k_node, bsz
+        )
+        _, row_prob_t2, _ = self._row_prob_from_logits(
+            graph, logits_t2, active_edge, src, dst, veh_local, k_node, bsz
+        )
+
+        return {
+            "graph": graph,
+            "device": device,
+            "bsz": bsz,
+            "src": src,
+            "dst": dst,
+            "veh_local": veh_local,
+            "active_edge": active_edge,
+            "k_node": k_node,
+            "logits_t": logits_t,
+            "logits_t2": logits_t2,
+            "row_prob_t": row_prob_t,
+            "row_prob_t2": row_prob_t2,
+            "row_ce": 0.5 * (row_ce_t + row_ce_t2),
+        }
+
+    def _two_time_consistency_kl(self, ctx):
+        return self._row_consistency_kl(
+            ctx["graph"],
+            ctx["logits_t"],
+            ctx["logits_t2"],
+            ctx["active_edge"],
+            ctx["src"],
+            ctx["dst"],
+            ctx["veh_local"],
+            ctx["k_node"],
+            ctx["bsz"],
+        )
+
+    @staticmethod
     def _edge_onehot_from_row(
             y_row: torch.Tensor,
             veh_local: torch.Tensor,
@@ -550,5 +673,17 @@ class RowCategoricalConsistencyBase(MetaConsistency):
                 (veh_local.long() == y_row.long()[dst]).float()
                 * active_edge.float()
         )
+
+    def _active_edge_mask(
+            self,
+            graph,
+            src: torch.Tensor,
+            dst: torch.Tensor,
+            edge_graph: torch.Tensor,
+            veh_local: torch.Tensor,
+            bsz: int,
+            device,
+    ) -> torch.Tensor:
+        return torch.ones_like(src, dtype=torch.bool, device=device)
 
 
