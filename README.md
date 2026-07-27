@@ -1,4 +1,4 @@
-# BigDiff: Bipartite Graph-Based Diffusion Solvers for Vehicle Routing Problems
+# BIGDiff: Bipartite Graph-Based Diffusion Solvers for Vehicle Routing Problems
 
 BigDiff is a bipartite graph-based diffusion framework for vehicle routing problems (VRPs).  
 Instead of directly reconstructing a complete visiting sequence, BigDiff decomposes routing into two stages:
